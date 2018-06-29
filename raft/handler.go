@@ -30,6 +30,12 @@ import (
 	"github.com/coreos/etcd/rafthttp"
 	"github.com/syndtr/goleveldb/leveldb"
 	"gopkg.in/fatih/set.v0"
+	"encoding/pem"
+	"crypto/rsa"
+	"crypto/x509"
+	"errors"
+	"io/ioutil"
+	"crypto"
 )
 
 type ProtocolManager struct {
@@ -87,6 +93,9 @@ type ProtocolManager struct {
 	// Storage
 	quorumRaftDb *leveldb.DB             // Persistent storage for last-applied raft index
 	raftStorage  *etcdRaft.MemoryStorage // Volatile raft storage
+
+	quorumPrivateKey *rsa.PrivateKey
+	quorumPublicKeysByNodeId map[uint16] *rsa.PublicKey
 }
 
 //
@@ -97,6 +106,8 @@ func NewProtocolManager(raftId uint16, raftPort uint16, blockchain *core.BlockCh
 	waldir := fmt.Sprintf("%s/raft-wal", datadir)
 	snapdir := fmt.Sprintf("%s/raft-snap", datadir)
 	quorumRaftDbLoc := fmt.Sprintf("%s/quorum-raft-state", datadir)
+	privateKeyLoc := fmt.Sprintf("%s/quorum-raft-private-key", datadir)
+	publicKeyLoc := fmt.Sprintf("%s/quorum-raft-public-key", datadir)
 
 	manager := &ProtocolManager{
 		bootstrapNodes:      bootstrapNodes,
@@ -119,6 +130,16 @@ func NewProtocolManager(raftId uint16, raftPort uint16, blockchain *core.BlockCh
 		minter:              minter,
 		downloader:          downloader,
 	}
+
+	minter.protoManager = manager
+
+	privateKeyBytes,_ := ioutil.ReadFile(privateKeyLoc)
+	manager.quorumPrivateKey,_ = ParseRsaPrivateKeyFromPemStr( string(privateKeyBytes))
+
+	manager.quorumPublicKeysByNodeId = make(map[uint16] *rsa.PublicKey)
+	// TODO - scan the folder of public keys to create this map
+	publicKeyBytes,_ := ioutil.ReadFile(publicKeyLoc)
+	manager.quorumPublicKeysByNodeId[raftId],_ = ParseRsaPublicKeyFromPemStr( string(publicKeyBytes) )
 
 	if db, err := openQuorumRaftDb(quorumRaftDbLoc); err != nil {
 		return nil, err
@@ -841,12 +862,47 @@ func sleep(duration time.Duration) {
 	<-time.NewTimer(duration).C
 }
 
-func blockExtendsChain(block *types.Block, chain *core.BlockChain) bool {
+
+func (pm *ProtocolManager) isSignatureValid(block *types.Block) (bool){
+	var theSig QuorumSig
+	rlp.DecodeBytes(block.Header().Extra, &theSig)
+
+	// it is already there in the txhash field but if that changes somehow we need to be protected - thus recalculating
+	txHash := types.DeriveSha(types.Transactions(block.Transactions()))
+
+	var opts rsa.PSSOptions
+	opts.SaltLength = rsa.PSSSaltLengthAuto
+	newhash := crypto.SHA256
+	pssh := newhash.New()
+	pssh.Write(txHash.Bytes())
+	hashed := pssh.Sum(nil)
+
+	publicKey := pm.quorumPublicKeysByNodeId[theSig.RaftId]
+
+	err := rsa.VerifyPSS(
+		publicKey,
+		newhash,
+		hashed,
+		theSig.Signature,
+		&opts)
+
+	if nil == err {
+		return true
+	}
+	return false
+}
+
+func blockExtendsChain(block *types.Block, chain *core.BlockChain, pm *ProtocolManager) bool {
+
+	if !pm.isSignatureValid(block) {
+		return false;
+	}
+
 	return block.ParentHash() == chain.CurrentBlock().Hash()
 }
 
 func (pm *ProtocolManager) applyNewChainHead(block *types.Block) {
-	if !blockExtendsChain(block, pm.blockchain) {
+	if !blockExtendsChain(block, pm.blockchain, pm) {
 		headBlock := pm.blockchain.CurrentBlock()
 
 		log.Info("Non-extending block", "block", block.Hash(), "parent", block.ParentHash(), "head", headBlock.Hash())
@@ -880,4 +936,65 @@ func (pm *ProtocolManager) advanceAppliedIndex(index uint64) {
 	pm.mu.Lock()
 	pm.appliedIndex = index
 	pm.mu.Unlock()
+}
+
+
+func ExportRsaPrivateKeyAsPemStr(privkey *rsa.PrivateKey) string {
+	privkey_bytes := x509.MarshalPKCS1PrivateKey(privkey)
+	privkey_pem := pem.EncodeToMemory(
+		&pem.Block{
+			Type:  "RSA PRIVATE KEY",
+			Bytes: privkey_bytes,
+		},
+	)
+	return string(privkey_pem)
+}
+
+func ParseRsaPrivateKeyFromPemStr(privPEM string) (*rsa.PrivateKey, error) {
+	block, _ := pem.Decode([]byte(privPEM))
+	if block == nil {
+		return nil, errors.New("failed to parse PEM block containing the key")
+	}
+
+	priv, err := x509.ParsePKCS1PrivateKey(block.Bytes)
+	if err != nil {
+		return nil, err
+	}
+
+	return priv, nil
+}
+
+func ExportRsaPublicKeyAsPemStr(pubkey *rsa.PublicKey) (string, error) {
+	pubkey_bytes, err := x509.MarshalPKIXPublicKey(pubkey)
+	if err != nil {
+		return "", err
+	}
+	pubkey_pem := pem.EncodeToMemory(
+		&pem.Block{
+			Type:  "RSA PUBLIC KEY",
+			Bytes: pubkey_bytes,
+		},
+	)
+
+	return string(pubkey_pem), nil
+}
+
+func ParseRsaPublicKeyFromPemStr(pubPEM string) (*rsa.PublicKey, error) {
+	block, _ := pem.Decode([]byte(pubPEM))
+	if block == nil {
+		return nil, errors.New("failed to parse PEM block containing the key")
+	}
+
+	pub, err := x509.ParsePKIXPublicKey(block.Bytes)
+	if err != nil {
+		return nil, err
+	}
+
+	switch pub := pub.(type) {
+	case *rsa.PublicKey:
+		return pub, nil
+	default:
+		break // fall through
+	}
+	return nil, errors.New("Key type is not RSA")
 }

@@ -23,6 +23,11 @@ import (
 	"sync/atomic"
 	"time"
 
+	"crypto"
+	"crypto/rand"
+	"crypto/rsa"
+	"os"
+
 	"github.com/eapache/channels"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/consensus/ethash"
@@ -35,6 +40,8 @@ import (
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/miner"
 	"github.com/ethereum/go-ethereum/params"
+
+	"github.com/ethereum/go-ethereum/rlp"
 )
 
 // Current state information for building the next block
@@ -44,6 +51,12 @@ type work struct {
 	privateState *state.StateDB
 	Block        *types.Block
 	header       *types.Header
+}
+
+
+type QuorumSig struct {
+	RaftId 		uint16
+	Signature 	[] byte
 }
 
 type minter struct {
@@ -64,6 +77,7 @@ type minter struct {
 	chainHeadSub            event.Subscription
 	txPreChan               chan core.TxPreEvent
 	txPreSub                event.Subscription
+	protoManager 			*ProtocolManager
 }
 
 func newMinter(config *params.ChainConfig, eth *RaftService, blockTime time.Duration) *minter {
@@ -295,6 +309,36 @@ func (minter *minter) firePendingBlockEvents(logs []*types.Log) {
 	}()
 }
 
+func (minter *minter) produceSignature(input []byte) (signature []byte){
+
+	minterPrivateKey := minter.protoManager.quorumPrivateKey
+
+	var opts rsa.PSSOptions
+	opts.SaltLength = rsa.PSSSaltLengthAuto
+	PSSmessage := input
+	newhash := crypto.SHA256
+	pssh := newhash.New()
+	pssh.Write(PSSmessage)
+	hashed := pssh.Sum(nil)
+
+	toOutput, err := rsa.SignPSS(
+		rand.Reader,
+		minterPrivateKey,
+		newhash,
+		hashed,
+		&opts)
+
+	if err != nil {
+		fmt.Println(err)
+		os.Exit(1)
+	}
+
+	signature = toOutput
+	return signature
+}
+
+
+
 func (minter *minter) mintNewBlock() {
 	minter.mu.Lock()
 	defer minter.mu.Unlock()
@@ -313,6 +357,14 @@ func (minter *minter) mintNewBlock() {
 	minter.firePendingBlockEvents(logs)
 
 	header := work.header
+
+	txHash := types.DeriveSha(types.Transactions(committedTxes))
+
+	qSig := &QuorumSig{ minter.protoManager.raftId, minter.produceSignature(txHash.Bytes())}
+
+	extraBytes,_ := rlp.EncodeToBytes(qSig)
+
+	header.Extra = extraBytes
 
 	// commit state root after all state transitions.
 	ethash.AccumulateRewards(minter.chain.Config(), work.publicState, header, nil)
