@@ -968,7 +968,7 @@ func (pm *ProtocolManager) rotateLeader() {
 		newLeader = uint64(rand.Intn(7) + 1)
 	}
 
-	log.Info("Time to change leader!" , "currentLeader", pm.raftId, "newLeader", newLeader);
+	log.Info("Transfer leadership" , "currentLeader", pm.raftId, "newLeader", newLeader);
 	pm.rawNode().TransferLeadership(context.TODO(), uint64(pm.raftId), newLeader)
 
 }
