@@ -1,5 +1,7 @@
 # 7 nodes
 
+Don't foget to export GETH=/path/to/your/built/geth or the scripts (raft-init/raft-start/runscript) will fail to start it.
+
 This example configures 7 nodes, each with their own PrivateTransactionManager. Usage:
 
   - `raft-init.sh`: Initialize accounts and keystores
