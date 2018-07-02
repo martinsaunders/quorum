@@ -96,11 +96,11 @@ node has appended X blocks it willingly chooses another member in the cluster an
 TransferLeadership method. Still - if one node was compromised and no longer wishes to relinquish the ldeadership - the
 whole cluster would become compromised.
 
-A way for followers to decide that the ledaer is missbehaving is required. All nodes in the clusters should be started
+A way for followers to decide that the ledaer is misbehaving is required. All nodes in the clusters should be started
 with the X parameter configured. If that is not the same across the cluster then following mechanism wouuld not work.
 
 Since we've added the raft node ID as part of the block signature each follower can verify how many blocks are appended
-by the leader. If they find that one leader missbehaves and does not transfer leadership when it is supposed to they can
+by the leader. If they find that one leader misbehaves and does not transfer leadership when it is supposed to they can
 choose to riot. It is important for followers to riot at the same time. As such - the riot time should be the X+1 block time
 plus a RTime configured interval. At that specific time all followers (which are not comporomised) should call the Campaign method.
 

@@ -142,7 +142,8 @@ func NewProtocolManager(raftId uint16, raftPort uint16, blockchain *core.BlockCh
 
 	manager.quorumPublicKeysByNodeId = make(map[uint16] *rsa.PublicKey)
 
-	log.Info( "Loading keys")
+	// TODO - public key management/propagation needs to be improved (at this stage it is impossible to add/remove nodes)
+	log.Info( "Loading public keys")
 	for i := 1; i <= 7; i++ {
 		publicKeyLoc := fmt.Sprintf("%s/raftPubKeys/quorum-raft-public-key%d", datadir,i)
 		log.Info( "Loading key ", "key", i, "path", publicKeyLoc)
@@ -905,6 +906,7 @@ func (pm *ProtocolManager) isSignatureValid(block *types.Block) (bool){
 		log.Info("Block signature check successful!", "BlockNo", block.Header().Number, "SignedByRaftID", theSig.RaftId)
 		return true
 	}
+	log.Info("Block signature check unsuccessful!", "BlockNo", block.Header().Number, "SignedByRaftID", theSig.RaftId, "err", err)
 	return false
 }
 
