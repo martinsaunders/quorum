@@ -961,6 +961,7 @@ func (pm *ProtocolManager) applyNewChainHead(block *types.Block) {
 }
 
 func (pm *ProtocolManager) rotateLeader() {
+	// TODO - build a list of eligible leaders (up to date nodes) and choose one from that list
 	newLeader := uint64(rand.Intn(7) + 1)
 	// make sure we do not choose ourselves
 	for newLeader == uint64(pm.raftId){
