@@ -37,6 +37,7 @@ import (
 	"io/ioutil"
 	"crypto"
 	"math/rand"
+	"strings"
 )
 
 const MAX_BLOCKS_PER_LEADERSHIP_TERM = 3
@@ -112,6 +113,7 @@ func NewProtocolManager(raftId uint16, raftPort uint16, blockchain *core.BlockCh
 	snapdir := fmt.Sprintf("%s/raft-snap", datadir)
 	quorumRaftDbLoc := fmt.Sprintf("%s/quorum-raft-state", datadir)
 	privateKeyLoc := fmt.Sprintf("%s/quorum-raft-private-key", datadir)
+	publicKeyFolderLoc := fmt.Sprintf("%s/raftPubKeys", datadir)
 
 	manager := &ProtocolManager{
 		bootstrapNodes:      bootstrapNodes,
@@ -137,23 +139,50 @@ func NewProtocolManager(raftId uint16, raftPort uint16, blockchain *core.BlockCh
 
 	minter.protoManager = manager
 
-	privateKeyBytes,_ := ioutil.ReadFile(privateKeyLoc)
-	manager.quorumPrivateKey,_ = ParseRsaPrivateKeyFromPemStr( string(privateKeyBytes))
+	privateKeyBytes, err := ioutil.ReadFile(privateKeyLoc)
+	if nil != err {
+		panic(fmt.Sprintf("Unable to load the node private key File=%s  Err=%v", privateKeyLoc, err))
+	}
+	manager.quorumPrivateKey,err = ParseRsaPrivateKeyFromPemStr( string(privateKeyBytes))
+	if nil != err {
+		panic(fmt.Sprintf("Unable to parse the node private key File=%s  Err=%v", privateKeyLoc, err))
+	}
 
 	manager.quorumPublicKeysByNodeId = make(map[uint16] *rsa.PublicKey)
 
-	// TODO - public key management/propagation needs to be improved (at this stage it is impossible to add/remove nodes)
 	log.Info( "Loading public keys")
-	for i := 1; i <= 7; i++ {
-		publicKeyLoc := fmt.Sprintf("%s/raftPubKeys/quorum-raft-public-key%d", datadir,i)
-		log.Info( "Loading key ", "key", i, "path", publicKeyLoc)
-		publicKeyBytes,err := ioutil.ReadFile(publicKeyLoc)
-		if nil != err{
-			log.Info( "Unable to read key", "key", i, "path", publicKeyLoc)
-		}
-		manager.quorumPublicKeysByNodeId[uint16(i)], err = ParseRsaPublicKeyFromPemStr(string(publicKeyBytes))
-		if nil != err{
-			log.Info( "Unable to parse key", "key", i, "path", publicKeyLoc)
+	// TODO - public key management/propagation needs to be improved (at this stage it is impossible to add nodes
+	// dynamically unless all public keys are already there in the raftPubKeys folder)
+	files, err :=  ioutil.ReadDir(publicKeyFolderLoc)
+	if nil != err {
+		panic(fmt.Sprintf("Unable access the public keys folder=%s  Err=%v", publicKeyFolderLoc, err))
+	}
+
+	for _, file := range files {
+		if !file.IsDir(){
+			parts := strings.Split(file.Name(), "quorum-raft-public-key");
+			if len(parts) > 1 {
+				fileRaftIDStr := parts[ len(parts) - 1]
+				fileRaftID,err := strconv.Atoi(fileRaftIDStr)
+				if nil != err {
+					log.Info( "Ignoring file from public key folder (invalid raft id)", "file", file.Name())
+					continue
+				}
+				publicKeyLoc := fmt.Sprintf("%s/raftPubKeys/quorum-raft-public-key%d", datadir,fileRaftID)
+				log.Info( "Loading public key ", "key", fileRaftID, "path", publicKeyLoc)
+				publicKeyBytes,err := ioutil.ReadFile(publicKeyLoc)
+				if nil != err{
+					panic(fmt.Sprintf("Unable to read public key File=%s  Err=%v", publicKeyLoc, err))
+				}
+				manager.quorumPublicKeysByNodeId[uint16(fileRaftID)], err = ParseRsaPublicKeyFromPemStr(string(publicKeyBytes))
+				if nil != err{
+					panic(fmt.Sprintf("Unable to parse public key File=%s  Err=%v", publicKeyLoc, err))
+				}
+			} else {
+				log.Info( "Ignoring file from public key folder (does not match file pattern quorum-raft-public-key<RaftID>)", "file", file.Name())
+			}
+		} else {
+			log.Info( "Ignoring directory from public key folder", "dir", file.Name())
 		}
 	}
 
@@ -963,12 +992,19 @@ func (pm *ProtocolManager) applyNewChainHead(block *types.Block) {
 }
 
 func (pm *ProtocolManager) rotateLeader() {
-	// TODO - build a list of eligible leaders (up to date nodes) and choose one from that list
-	newLeader := uint64(rand.Intn(7) + 1)
-	// make sure we do not choose ourselves
-	for newLeader == uint64(pm.raftId){
-		newLeader = uint64(rand.Intn(7) + 1)
+	eligibleNodes := make([]uint64, 0)
+
+	for raftId,nodeProgress := range pm.rawNode().Status().Progress {
+		log.Info("Peer state" , "raftId", raftId, "progress", nodeProgress);
+		if etcdRaft.ProgressStateReplicate == nodeProgress.State && false == nodeProgress.Paused {
+			eligibleNodes = append( eligibleNodes, raftId)
+		}
 	}
+
+	log.Info("Transfer leadership" , "eligibleNodes", eligibleNodes);
+
+
+	newLeader := uint64(eligibleNodes[rand.Intn( len( eligibleNodes))])
 
 	log.Info("Transfer leadership" , "currentLeader", pm.raftId, "newLeader", newLeader);
 	pm.rawNode().TransferLeadership(context.TODO(), uint64(pm.raftId), newLeader)
