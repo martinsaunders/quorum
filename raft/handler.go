@@ -96,6 +96,8 @@ type ProtocolManager struct {
 
 	quorumPrivateKey *rsa.PrivateKey
 	quorumPublicKeysByNodeId map[uint16] *rsa.PublicKey
+
+	msgCountSinceBecomingLeader int64
 }
 
 //
@@ -107,7 +109,6 @@ func NewProtocolManager(raftId uint16, raftPort uint16, blockchain *core.BlockCh
 	snapdir := fmt.Sprintf("%s/raft-snap", datadir)
 	quorumRaftDbLoc := fmt.Sprintf("%s/quorum-raft-state", datadir)
 	privateKeyLoc := fmt.Sprintf("%s/quorum-raft-private-key", datadir)
-	publicKeyLoc := fmt.Sprintf("%s/quorum-raft-public-key", datadir)
 
 	manager := &ProtocolManager{
 		bootstrapNodes:      bootstrapNodes,
@@ -137,9 +138,20 @@ func NewProtocolManager(raftId uint16, raftPort uint16, blockchain *core.BlockCh
 	manager.quorumPrivateKey,_ = ParseRsaPrivateKeyFromPemStr( string(privateKeyBytes))
 
 	manager.quorumPublicKeysByNodeId = make(map[uint16] *rsa.PublicKey)
-	// TODO - scan the folder of public keys to create this map
-	publicKeyBytes,_ := ioutil.ReadFile(publicKeyLoc)
-	manager.quorumPublicKeysByNodeId[raftId],_ = ParseRsaPublicKeyFromPemStr( string(publicKeyBytes) )
+
+	log.Info( "Loading keys")
+	for i := 1; i <= 7; i++ {
+		publicKeyLoc := fmt.Sprintf("%s/raftPubKeys/quorum-raft-public-key%d", datadir,i)
+		log.Info( "Loading key ", "key", i, "path", publicKeyLoc)
+		publicKeyBytes,err := ioutil.ReadFile(publicKeyLoc)
+		if nil != err{
+			log.Info( "Unable to read key", "key", i, "path", publicKeyLoc)
+		}
+		manager.quorumPublicKeysByNodeId[uint16(i)], err = ParseRsaPublicKeyFromPemStr(string(publicKeyBytes))
+		if nil != err{
+			log.Info( "Unable to parse key", "key", i, "path", publicKeyLoc)
+		}
+	}
 
 	if db, err := openQuorumRaftDb(quorumRaftDbLoc); err != nil {
 		return nil, err
@@ -887,6 +899,7 @@ func (pm *ProtocolManager) isSignatureValid(block *types.Block) (bool){
 		&opts)
 
 	if nil == err {
+		log.Info("Block signature check successful!", "BlockNo", block.Header().Number, "SignedByRaftID", theSig.RaftId)
 		return true
 	}
 	return false
@@ -901,7 +914,12 @@ func blockExtendsChain(block *types.Block, chain *core.BlockChain, pm *ProtocolM
 	return block.ParentHash() == chain.CurrentBlock().Hash()
 }
 
+func (pm *ProtocolManager) isLeader() bool {
+	return pm.rawNode().Status().ID == pm.rawNode().Status().Lead
+}
+
 func (pm *ProtocolManager) applyNewChainHead(block *types.Block) {
+
 	if !blockExtendsChain(block, pm.blockchain, pm) {
 		headBlock := pm.blockchain.CurrentBlock()
 
@@ -925,8 +943,35 @@ func (pm *ProtocolManager) applyNewChainHead(block *types.Block) {
 			panic(fmt.Sprintf("failed to extend chain: %s", err.Error()))
 		}
 
+		//if pm.isLeader(){
+		//	pm.msgCountSinceBecomingLeader++
+		//	if pm.msgCountSinceBecomingLeader > 10{
+		//		log.Info("Time to change leader!")
+		//		pm.rotateLeader()
+		//	}
+		//}
+
 		log.EmitCheckpoint(log.BlockCreated, "block", fmt.Sprintf("%x", block.Hash()))
 	}
+}
+
+func (pm *ProtocolManager) rotateLeader() {
+	if pm.rawNode().Status().Lead == pm.rawNode().Status().ID {
+
+		// find eligible nodes - ones that are up to date
+		//for rID, stat := range
+		//
+		//pm.rawNode().Status().Progress[1].
+		//	newLeader := uint64(rand.Intn(3) + 1)
+		//	log.Println("Time to change leader! Proposed leader " , newLeader);
+		//	if newLeader == rc.node.Status().Lead{
+		//		log.Println("Nothing to do - proposed myself" , newLeader);
+		//	} else {
+		//		rc.node.TransferLeadership(context.TODO(), rc.node.Status().Lead, newLeader)
+		//	}
+		//}
+	}
+
 }
 
 // Sets new appliedIndex in-memory, *and* writes this appliedIndex to LevelDB.

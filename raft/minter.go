@@ -366,6 +366,9 @@ func (minter *minter) mintNewBlock() {
 
 	header.Extra = extraBytes
 
+	log.Info("Block signed")
+
+
 	// commit state root after all state transitions.
 	ethash.AccumulateRewards(minter.chain.Config(), work.publicState, header, nil)
 	header.Root = work.publicState.IntermediateRoot(minter.chain.Config().IsEIP158(work.header.Number))
