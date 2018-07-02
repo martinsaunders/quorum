@@ -403,6 +403,7 @@ func (minter *minter) mintNewBlock() {
 
 	elapsed := time.Since(time.Unix(0, header.Time.Int64()))
 	log.Info("🔨  Mined block", "number", block.Number(), "hash", fmt.Sprintf("%x", block.Hash().Bytes()[:4]), "elapsed", elapsed)
+	minter.protoManager.msgCountSinceBecomingLeader++
 }
 
 func (env *work) commitTransactions(txes *types.TransactionsByPriceAndNonce, bc *core.BlockChain) (types.Transactions, types.Receipts, types.Receipts, []*types.Log) {

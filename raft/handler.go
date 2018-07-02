@@ -36,7 +36,10 @@ import (
 	"errors"
 	"io/ioutil"
 	"crypto"
+	"math/rand"
 )
+
+const MAX_BLOCKS_PER_LEADERSHIP_TERM = 3
 
 type ProtocolManager struct {
 	mu       sync.RWMutex // For protecting concurrent JS access to "local peer" and "remote peer" state
@@ -943,34 +946,29 @@ func (pm *ProtocolManager) applyNewChainHead(block *types.Block) {
 			panic(fmt.Sprintf("failed to extend chain: %s", err.Error()))
 		}
 
-		//if pm.isLeader(){
-		//	pm.msgCountSinceBecomingLeader++
-		//	if pm.msgCountSinceBecomingLeader > 10{
-		//		log.Info("Time to change leader!")
-		//		pm.rotateLeader()
-		//	}
-		//}
+		if pm.isLeader(){
+			if pm.msgCountSinceBecomingLeader >= MAX_BLOCKS_PER_LEADERSHIP_TERM {
+				log.Info("Time to change leader!")
+				pm.rotateLeader()
+			}
+		} else {
+			pm.msgCountSinceBecomingLeader = 0
+			//TODO implement rioting
+		}
 
 		log.EmitCheckpoint(log.BlockCreated, "block", fmt.Sprintf("%x", block.Hash()))
 	}
 }
 
 func (pm *ProtocolManager) rotateLeader() {
-	if pm.rawNode().Status().Lead == pm.rawNode().Status().ID {
-
-		// find eligible nodes - ones that are up to date
-		//for rID, stat := range
-		//
-		//pm.rawNode().Status().Progress[1].
-		//	newLeader := uint64(rand.Intn(3) + 1)
-		//	log.Println("Time to change leader! Proposed leader " , newLeader);
-		//	if newLeader == rc.node.Status().Lead{
-		//		log.Println("Nothing to do - proposed myself" , newLeader);
-		//	} else {
-		//		rc.node.TransferLeadership(context.TODO(), rc.node.Status().Lead, newLeader)
-		//	}
-		//}
+	newLeader := uint64(rand.Intn(7) + 1)
+	// make sure we do not choose ourselves
+	for newLeader == uint64(pm.raftId){
+		newLeader = uint64(rand.Intn(7) + 1)
 	}
+
+	log.Info("Time to change leader!" , "currentLeader", pm.raftId, "newLeader", newLeader);
+	pm.rawNode().TransferLeadership(context.TODO(), uint64(pm.raftId), newLeader)
 
 }
 
