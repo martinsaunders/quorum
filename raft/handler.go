@@ -944,7 +944,7 @@ func blockExtendsChain(block *types.Block, chain *core.BlockChain, pm *ProtocolM
 	if !pm.isSignatureValid(block) {
 		return false;
 	}
-
+	// TODO check the RAFT history and verify that the minter of the block was the leader at block.time (we probably need to add the RAFT term in the QuorumSig structure)
 	return block.ParentHash() == chain.CurrentBlock().Hash()
 }
 
