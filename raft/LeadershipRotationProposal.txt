@@ -1,0 +1,113 @@
+
+Raft has an API to transfer leadership from the leader node to another node in the cluster.
+
+	// TransferLeadership attempts to transfer leadership to the given transferee.
+	TransferLeadership(ctx context.Context, lead, transferee uint64)
+
+In addition to the above a single node can be forced into becoming a candidate by calling the Campaign method.
+
+	// Campaign causes the Node to transition to candidate state and start campaigning to become leader.
+	Campaign(ctx context.Context) error
+
+We experimented with the raftexample project which is part of etcd. In a cluster of three nodes the following method (thread)
+caused the cluster to rotate the leader randomly (the leader would choose at random which other node from the
+cluster to become leader and transfer leaderhip to it).
+
+func (rc *raftNode) rotateLeader() {
+	counter := 0
+	for {
+		counter++
+		time.Sleep(1000 * time.Millisecond);
+		log.Println("Check whether I'm leader and transfer leadership ar random");
+		log.Println("LeaderNode ",  rc.node.Status().Lead, " CurrentNode ", rc.node.Status().ID);
+
+		if rc.node.Status().Lead == rc.node.Status().ID{
+			log.Println("I'm leader! See if it's time to change...");
+			if counter % 20 == 0{
+				newLeader := uint64(rand.Intn(3) + 1)
+				log.Println("Time to change leader! Proposed leader " , newLeader);
+				if newLeader == rc.node.Status().Lead{
+					log.Println("Nothing to do - proposed myself" , newLeader);
+				} else {
+					rc.node.TransferLeadership(context.TODO(), rc.node.Status().Lead, newLeader)
+				}
+			}
+		}
+	}
+}
+
+
+Please find below some log statements in support of the above:
+
+Node 1:
+
+2018-07-02 10:05:01.636738 I | Check whether I'm leader and transfer leadership ar random
+2018-07-02 10:05:01.636862 I | LeaderNode  1  CurrentNode  1
+2018-07-02 10:05:01.636972 I | I'm leader! See if it's time to change...
+2018-07-02 10:05:01.637014 I | Time to change leader! Proposed leader  3
+raft2018/07/02 10:05:01 INFO: 1 [term 386] starts to transfer leadership to 3
+raft2018/07/02 10:05:01 INFO: 1 sends MsgTimeoutNow to 3 immediately as 3 already has up-to-date log
+raft2018/07/02 10:05:01 INFO: 1 [term: 386] received a MsgVote message with higher term from 3 [term: 387]
+raft2018/07/02 10:05:01 INFO: 1 became follower at term 387
+raft2018/07/02 10:05:01 INFO: 1 [logterm: 386, index: 380, vote: 0] cast MsgVote for 3 [logterm: 386, index: 380] at term 387
+raft2018/07/02 10:05:01 INFO: raft.node: 1 lost leader 1 at term 387
+raft2018/07/02 10:05:01 INFO: raft.node: 1 elected leader 3 at term 387
+
+
+Node 2:
+
+2018-07-02 10:05:00.096675 I | Check whether I'm leader and transfer leadership ar random
+2018-07-02 10:05:00.096865 I | LeaderNode  1  CurrentNode  2
+2018-07-02 10:05:01.097143 I | Check whether I'm leader and transfer leadership ar random
+2018-07-02 10:05:01.097303 I | LeaderNode  1  CurrentNode  2
+raft2018/07/02 10:05:01 INFO: 2 [term: 386] received a MsgVote message with higher term from 3 [term: 387]
+raft2018/07/02 10:05:01 INFO: 2 became follower at term 387
+raft2018/07/02 10:05:01 INFO: 2 [logterm: 386, index: 380, vote: 0] cast MsgVote for 3 [logterm: 386, index: 380] at term 387
+raft2018/07/02 10:05:01 INFO: raft.node: 2 lost leader 1 at term 387
+raft2018/07/02 10:05:01 INFO: raft.node: 2 elected leader 3 at term 387
+
+
+Node 3:
+
+2018-07-02 10:04:58.650157 I | Check whether I'm leader and transfer leadership ar random
+2018-07-02 10:04:58.650285 I | LeaderNode  1  CurrentNode  3
+2018-07-02 10:04:59.650413 I | Check whether I'm leader and transfer leadership ar random
+2018-07-02 10:04:59.650439 I | LeaderNode  1  CurrentNode  3
+2018-07-02 10:05:00.650674 I | Check whether I'm leader and transfer leadership ar random
+2018-07-02 10:05:00.650795 I | LeaderNode  1  CurrentNode  3
+raft2018/07/02 10:05:01 INFO: 3 [term 386] received MsgTimeoutNow from 1 and starts an election to get leadership.
+raft2018/07/02 10:05:01 INFO: 3 became candidate at term 387
+raft2018/07/02 10:05:01 INFO: 3 received MsgVoteResp from 3 at term 387
+raft2018/07/02 10:05:01 INFO: 3 [logterm: 386, index: 380] sent MsgVote request to 1 at term 387
+raft2018/07/02 10:05:01 INFO: 3 [logterm: 386, index: 380] sent MsgVote request to 2 at term 387
+raft2018/07/02 10:05:01 INFO: raft.node: 3 lost leader 1 at term 387
+raft2018/07/02 10:05:01 INFO: 3 received MsgVoteResp from 1 at term 387
+raft2018/07/02 10:05:01 INFO: 3 [quorum:2] has received 2 MsgVoteResp votes and 0 vote rejections
+raft2018/07/02 10:05:01 INFO: 3 became leader at term 387
+raft2018/07/02 10:05:01 INFO: raft.node: 3 elected leader 3 at term 387
+
+
+In Quorum we need to decide what should trigger a leadership change (however multiple policies can be implemented):
+1. time spent as leader
+2. blocks minted as leader
+
+Suppose a leader would have to change every X blocks. As part of the minter (or handler - in applyNewChainHead), once the
+node has appended X blocks it willingly chooses another member in the cluster and transfers leadership using the
+TransferLeadership method. Still - if one node was compromised and no longer wishes to relinquish the ldeadership - the
+whole cluster would become compromised.
+
+A way for followers to decide that the ledaer is misbehaving is required. All nodes in the clusters should be started
+with the X parameter configured. If that is not the same across the cluster then following mechanism wouuld not work.
+
+Since we've added the raft node ID as part of the block signature each follower can verify how many blocks are appended
+by the leader. If they find that one leader misbehaves and does not transfer leadership when it is supposed to they can
+choose to riot. It is important for followers to riot at the same time. As such - the riot time should be the X+1 block time
+plus a RTime configured interval. At that specific time all followers (which are not comporomised) should call the Campaign method.
+
+Another attack could be that the compromised leader node does not mint any new blocks - thus blocking the whole network.
+In such a situation the followers should riot at the last minted block time plus the RTime interval.
+
+Another check that the followers should perform is that leadership is not transferred between a small minority of the
+network nodes (which would allow 2 compromised nodes to transfer leadership between each other and control the network
+that way).
+

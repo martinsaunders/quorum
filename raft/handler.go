@@ -30,7 +30,17 @@ import (
 	"github.com/coreos/etcd/rafthttp"
 	"github.com/syndtr/goleveldb/leveldb"
 	"gopkg.in/fatih/set.v0"
+	"encoding/pem"
+	"crypto/rsa"
+	"crypto/x509"
+	"errors"
+	"io/ioutil"
+	"crypto"
+	"math/rand"
+	"strings"
 )
+
+const MAX_BLOCKS_PER_LEADERSHIP_TERM = 3
 
 type ProtocolManager struct {
 	mu       sync.RWMutex // For protecting concurrent JS access to "local peer" and "remote peer" state
@@ -87,6 +97,11 @@ type ProtocolManager struct {
 	// Storage
 	quorumRaftDb *leveldb.DB             // Persistent storage for last-applied raft index
 	raftStorage  *etcdRaft.MemoryStorage // Volatile raft storage
+
+	quorumPrivateKey *rsa.PrivateKey
+	quorumPublicKeysByNodeId map[uint16] *rsa.PublicKey
+
+	msgCountSinceBecomingLeader int64
 }
 
 //
@@ -97,6 +112,8 @@ func NewProtocolManager(raftId uint16, raftPort uint16, blockchain *core.BlockCh
 	waldir := fmt.Sprintf("%s/raft-wal", datadir)
 	snapdir := fmt.Sprintf("%s/raft-snap", datadir)
 	quorumRaftDbLoc := fmt.Sprintf("%s/quorum-raft-state", datadir)
+	privateKeyLoc := fmt.Sprintf("%s/quorum-raft-private-key", datadir)
+	publicKeyFolderLoc := fmt.Sprintf("%s/raftPubKeys", datadir)
 
 	manager := &ProtocolManager{
 		bootstrapNodes:      bootstrapNodes,
@@ -118,6 +135,55 @@ func NewProtocolManager(raftId uint16, raftPort uint16, blockchain *core.BlockCh
 		raftStorage:         etcdRaft.NewMemoryStorage(),
 		minter:              minter,
 		downloader:          downloader,
+	}
+
+	minter.protoManager = manager
+
+	privateKeyBytes, err := ioutil.ReadFile(privateKeyLoc)
+	if nil != err {
+		panic(fmt.Sprintf("Unable to load the node private key File=%s  Err=%v", privateKeyLoc, err))
+	}
+	manager.quorumPrivateKey,err = ParseRsaPrivateKeyFromPemStr( string(privateKeyBytes))
+	if nil != err {
+		panic(fmt.Sprintf("Unable to parse the node private key File=%s  Err=%v", privateKeyLoc, err))
+	}
+
+	manager.quorumPublicKeysByNodeId = make(map[uint16] *rsa.PublicKey)
+
+	log.Info( "Loading public keys")
+	// TODO - public key management/propagation needs to be improved (at this stage it is impossible to add nodes
+	// dynamically unless all public keys are already there in the raftPubKeys folder)
+	files, err :=  ioutil.ReadDir(publicKeyFolderLoc)
+	if nil != err {
+		panic(fmt.Sprintf("Unable access the public keys folder=%s  Err=%v", publicKeyFolderLoc, err))
+	}
+
+	for _, file := range files {
+		if !file.IsDir(){
+			parts := strings.Split(file.Name(), "quorum-raft-public-key");
+			if len(parts) > 1 {
+				fileRaftIDStr := parts[ len(parts) - 1]
+				fileRaftID,err := strconv.Atoi(fileRaftIDStr)
+				if nil != err {
+					log.Info( "Ignoring file from public key folder (invalid raft id)", "file", file.Name())
+					continue
+				}
+				publicKeyLoc := fmt.Sprintf("%s/raftPubKeys/quorum-raft-public-key%d", datadir,fileRaftID)
+				log.Info( "Loading public key ", "key", fileRaftID, "path", publicKeyLoc)
+				publicKeyBytes,err := ioutil.ReadFile(publicKeyLoc)
+				if nil != err{
+					panic(fmt.Sprintf("Unable to read public key File=%s  Err=%v", publicKeyLoc, err))
+				}
+				manager.quorumPublicKeysByNodeId[uint16(fileRaftID)], err = ParseRsaPublicKeyFromPemStr(string(publicKeyBytes))
+				if nil != err{
+					panic(fmt.Sprintf("Unable to parse public key File=%s  Err=%v", publicKeyLoc, err))
+				}
+			} else {
+				log.Info( "Ignoring file from public key folder (does not match file pattern quorum-raft-public-key<RaftID>)", "file", file.Name())
+			}
+		} else {
+			log.Info( "Ignoring directory from public key folder", "dir", file.Name())
+		}
 	}
 
 	if db, err := openQuorumRaftDb(quorumRaftDbLoc); err != nil {
@@ -841,12 +907,54 @@ func sleep(duration time.Duration) {
 	<-time.NewTimer(duration).C
 }
 
-func blockExtendsChain(block *types.Block, chain *core.BlockChain) bool {
+
+func (pm *ProtocolManager) isSignatureValid(block *types.Block) (bool){
+	var theSig QuorumSig
+	rlp.DecodeBytes(block.Header().Extra, &theSig)
+
+	// it is already there in the txhash field but if that changes somehow we need to be protected - thus recalculating
+	txHash := types.DeriveSha(types.Transactions(block.Transactions()))
+
+	var opts rsa.PSSOptions
+	opts.SaltLength = rsa.PSSSaltLengthAuto
+	newhash := crypto.SHA256
+	pssh := newhash.New()
+	pssh.Write(txHash.Bytes())
+	hashed := pssh.Sum(nil)
+
+	publicKey := pm.quorumPublicKeysByNodeId[theSig.RaftId]
+
+	err := rsa.VerifyPSS(
+		publicKey,
+		newhash,
+		hashed,
+		theSig.Signature,
+		&opts)
+
+	if nil == err {
+		log.Info("Block signature check successful!", "BlockNo", block.Header().Number, "SignedByRaftID", theSig.RaftId)
+		return true
+	}
+	log.Info("Block signature check unsuccessful!", "BlockNo", block.Header().Number, "SignedByRaftID", theSig.RaftId, "err", err)
+	return false
+}
+
+func blockExtendsChain(block *types.Block, chain *core.BlockChain, pm *ProtocolManager) bool {
+
+	if !pm.isSignatureValid(block) {
+		return false;
+	}
+	// TODO check the RAFT history and verify that the minter of the block was the leader at block.time (we probably need to add the RAFT term in the QuorumSig structure)
 	return block.ParentHash() == chain.CurrentBlock().Hash()
 }
 
+func (pm *ProtocolManager) isLeader() bool {
+	return pm.rawNode().Status().ID == pm.rawNode().Status().Lead
+}
+
 func (pm *ProtocolManager) applyNewChainHead(block *types.Block) {
-	if !blockExtendsChain(block, pm.blockchain) {
+
+	if !blockExtendsChain(block, pm.blockchain, pm) {
 		headBlock := pm.blockchain.CurrentBlock()
 
 		log.Info("Non-extending block", "block", block.Hash(), "parent", block.ParentHash(), "head", headBlock.Hash())
@@ -869,8 +977,38 @@ func (pm *ProtocolManager) applyNewChainHead(block *types.Block) {
 			panic(fmt.Sprintf("failed to extend chain: %s", err.Error()))
 		}
 
+		if pm.isLeader(){
+			if pm.msgCountSinceBecomingLeader >= MAX_BLOCKS_PER_LEADERSHIP_TERM {
+				log.Info("Time to change leader!")
+				pm.rotateLeader()
+			}
+		} else {
+			pm.msgCountSinceBecomingLeader = 0
+			//TODO implement rioting
+		}
+
 		log.EmitCheckpoint(log.BlockCreated, "block", fmt.Sprintf("%x", block.Hash()))
 	}
+}
+
+func (pm *ProtocolManager) rotateLeader() {
+	eligibleNodes := make([]uint64, 0)
+
+	for raftId,nodeProgress := range pm.rawNode().Status().Progress {
+		log.Info("Peer state" , "raftId", raftId, "progress", nodeProgress);
+		if etcdRaft.ProgressStateReplicate == nodeProgress.State && false == nodeProgress.Paused {
+			eligibleNodes = append( eligibleNodes, raftId)
+		}
+	}
+
+	log.Info("Transfer leadership" , "eligibleNodes", eligibleNodes);
+
+
+	newLeader := uint64(eligibleNodes[rand.Intn( len( eligibleNodes))])
+
+	log.Info("Transfer leadership" , "currentLeader", pm.raftId, "newLeader", newLeader);
+	pm.rawNode().TransferLeadership(context.TODO(), uint64(pm.raftId), newLeader)
+
 }
 
 // Sets new appliedIndex in-memory, *and* writes this appliedIndex to LevelDB.
@@ -880,4 +1018,65 @@ func (pm *ProtocolManager) advanceAppliedIndex(index uint64) {
 	pm.mu.Lock()
 	pm.appliedIndex = index
 	pm.mu.Unlock()
+}
+
+
+func ExportRsaPrivateKeyAsPemStr(privkey *rsa.PrivateKey) string {
+	privkey_bytes := x509.MarshalPKCS1PrivateKey(privkey)
+	privkey_pem := pem.EncodeToMemory(
+		&pem.Block{
+			Type:  "RSA PRIVATE KEY",
+			Bytes: privkey_bytes,
+		},
+	)
+	return string(privkey_pem)
+}
+
+func ParseRsaPrivateKeyFromPemStr(privPEM string) (*rsa.PrivateKey, error) {
+	block, _ := pem.Decode([]byte(privPEM))
+	if block == nil {
+		return nil, errors.New("failed to parse PEM block containing the key")
+	}
+
+	priv, err := x509.ParsePKCS1PrivateKey(block.Bytes)
+	if err != nil {
+		return nil, err
+	}
+
+	return priv, nil
+}
+
+func ExportRsaPublicKeyAsPemStr(pubkey *rsa.PublicKey) (string, error) {
+	pubkey_bytes, err := x509.MarshalPKIXPublicKey(pubkey)
+	if err != nil {
+		return "", err
+	}
+	pubkey_pem := pem.EncodeToMemory(
+		&pem.Block{
+			Type:  "RSA PUBLIC KEY",
+			Bytes: pubkey_bytes,
+		},
+	)
+
+	return string(pubkey_pem), nil
+}
+
+func ParseRsaPublicKeyFromPemStr(pubPEM string) (*rsa.PublicKey, error) {
+	block, _ := pem.Decode([]byte(pubPEM))
+	if block == nil {
+		return nil, errors.New("failed to parse PEM block containing the key")
+	}
+
+	pub, err := x509.ParsePKIXPublicKey(block.Bytes)
+	if err != nil {
+		return nil, err
+	}
+
+	switch pub := pub.(type) {
+	case *rsa.PublicKey:
+		return pub, nil
+	default:
+		break // fall through
+	}
+	return nil, errors.New("Key type is not RSA")
 }
